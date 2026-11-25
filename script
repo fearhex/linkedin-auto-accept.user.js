@@ -1,0 +1,225 @@
+// ==UserScript==
+// @name         LinkedIn Invite Auto-Accept
+// @namespace    https://github.com/fearhex/linkedin-auto-accept
+// @version      1.0.0
+// @description  Clicks Accept on pending LinkedIn invitations with human-like delays, hard caps and a manual start button. No API keys, no stored credentials.
+// @author       fearhex
+// @match        https://www.linkedin.com/mynetwork/invitation-manager/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ---- config -------------------------------------------------------------
+  const CONFIG = {
+    minDelayMs: 2500,      // shortest pause between two accepts
+    maxDelayMs: 6000,      // longest pause between two accepts
+    maxPerSession: 20,     // hard stop for a single run
+    maxPerDay: 60,         // hard stop across the whole day (stored in localStorage)
+    pauseWhenHidden: true, // don't click while the tab is in the background
+    dryRun: false,         // true = highlight the next button instead of clicking it
+  };
+
+  const STORAGE_KEY = 'liaa:daily';
+
+  let running = false;
+  let sessionCount = 0;
+  let idleRounds = 0;
+  let status = 'Start manually when ready.';
+  const clicked = new WeakSet();
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rand = (a, b) => a + Math.random() * (b - a);
+
+  // ---- daily counter ------------------------------------------------------
+  function todayKey() {
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  function getDaily() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+      if (raw && raw.date === todayKey() && typeof raw.count === 'number') return raw;
+    } catch (e) { /* corrupt value, fall through and reset */ }
+    return { date: todayKey(), count: 0 };
+  }
+
+  function bumpDaily() {
+    const d = getDaily();
+    d.count += 1;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(d));
+    return d.count;
+  }
+
+  // ---- UI (shadow DOM so LinkedIn's CSS can't touch it) --------------------
+  const host = document.createElement('div');
+  host.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;';
+  const root = host.attachShadow({ mode: 'open' });
+  root.innerHTML = `
+    <style>
+      .panel {
+        font: 12px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        width: 200px; padding: 11px 13px; border-radius: 10px;
+        background: #1b1f24; color: #e7e9ea;
+        border: 1px solid #31363b; box-shadow: 0 8px 28px rgba(0,0,0,.4);
+      }
+      .row { display: flex; justify-content: space-between; gap: 8px; margin: 3px 0; }
+      .head { margin-bottom: 6px; }
+      .muted { color: #9aa4ad; }
+      button {
+        width: 100%; margin-top: 9px; padding: 7px 0; border: 0; border-radius: 6px;
+        font: inherit; font-weight: 600; cursor: pointer;
+        background: #2d7ff9; color: #fff;
+      }
+      button:hover { filter: brightness(1.1); }
+      button.stop { background: #c0392b; }
+      .note { margin-top: 7px; color: #9aa4ad; }
+      .note.warn { color: #ffb74d; }
+    </style>
+    <div class="panel">
+      <div class="row head"><strong>Auto-Accept</strong><span class="muted" id="state">idle</span></div>
+      <div class="row"><span class="muted">this run</span><span id="sess">0 / 0</span></div>
+      <div class="row"><span class="muted">today</span><span id="day">0 / 0</span></div>
+      <button id="toggle">Start</button>
+      <div class="note" id="note"></div>
+    </div>
+  `;
+
+  const el = {
+    state: root.getElementById('state'),
+    sess: root.getElementById('sess'),
+    day: root.getElementById('day'),
+    toggle: root.getElementById('toggle'),
+    note: root.getElementById('note'),
+  };
+
+  function render() {
+    const daily = getDaily();
+    el.state.textContent = running ? 'running' : 'idle';
+    el.sess.textContent = sessionCount + ' / ' + CONFIG.maxPerSession;
+    el.day.textContent = daily.count + ' / ' + CONFIG.maxPerDay;
+    el.toggle.textContent = running ? 'Stop' : 'Start';
+    el.toggle.classList.toggle('stop', running);
+    el.note.textContent = status;
+    el.note.classList.toggle('warn', !running && status !== 'Start manually when ready.');
+  }
+
+  // ---- finding things on the page -----------------------------------------
+  function isAcceptButton(b) {
+    if (clicked.has(b) || b.disabled) return false;
+    if (b.getAttribute('aria-hidden') === 'true') return false;
+    const label = (b.getAttribute('aria-label') || '').trim();
+    const text = (b.innerText || '').replace(/\s+/g, ' ').trim();
+    if (/^accept\b/i.test(label)) return true;   // "Accept Jane Doe's invitation"
+    if (/^accept$/i.test(text)) return true;     // plain "Accept" label
+    return false;
+  }
+
+  function findAcceptButton() {
+    // Prefer buttons inside an invitation card, fall back to the whole page.
+    const scopes = [
+      ...document.querySelectorAll('[class*="invitation"]'),
+      document.querySelector('main'),
+      document.body,
+    ].filter(Boolean);
+
+    for (const scope of scopes) {
+      const btn = Array.from(scope.querySelectorAll('button')).find(isAcceptButton);
+      if (btn) return btn;
+    }
+    return null;
+  }
+
+  async function tryLoadMore() {
+    const more = Array.from(document.querySelectorAll('button')).find((b) =>
+      /^(load|show)\s+more$/i.test((b.innerText || '').replace(/\s+/g, ' ').trim())
+    );
+    if (more) {
+      more.click();
+      await sleep(rand(1200, 2000));
+      return true;
+    }
+    const before = document.body.scrollHeight;
+    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+    await sleep(rand(1500, 2500));
+    return document.body.scrollHeight > before;
+  }
+
+  function isBlocked() {
+    if (/\/(checkpoint|authwall|login)\b/.test(location.pathname)) return true;
+    const txt = (document.body.innerText || '').toLowerCase();
+    if (txt.includes('unusual activity') || txt.includes('security verification')) return true;
+    return !!document.querySelector('iframe[src*="captcha"], #captcha-internal');
+  }
+
+  // ---- the loop -----------------------------------------------------------
+  function stop(reason) {
+    running = false;
+    status = reason;
+    render();
+  }
+
+  async function run() {
+    running = true;
+    sessionCount = 0;
+    idleRounds = 0;
+    status = 'Working…';
+    render();
+
+    try {
+      while (running) {
+        if (sessionCount >= CONFIG.maxPerSession) return stop('Session limit reached.');
+        if (getDaily().count >= CONFIG.maxPerDay) return stop('Daily limit reached — try again tomorrow.');
+        if (isBlocked()) return stop('LinkedIn checkpoint detected. Stopped.');
+        if (CONFIG.pauseWhenHidden && document.hidden) {
+          await sleep(1000);
+          continue;
+        }
+
+        const btn = findAcceptButton();
+        if (!btn) {
+          if (idleRounds >= 3) return stop('No more invitations on this page.');
+          await tryLoadMore();
+          idleRounds += 1;
+          continue;
+        }
+
+        btn.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        await sleep(rand(400, 900));
+        if (!running) return;
+        if (!btn.isConnected) continue; // card re-rendered while we waited
+
+        if (CONFIG.dryRun) {
+          btn.style.outline = '3px solid #2d7ff9';
+          return stop('Dry run: found a button, did not click.');
+        }
+
+        clicked.add(btn);
+        btn.click();
+        sessionCount += 1;
+        bumpDaily();
+        idleRounds = 0;
+        status = 'Accepted ' + sessionCount + ' this run.';
+        render();
+
+        await sleep(rand(CONFIG.minDelayMs, CONFIG.maxDelayMs));
+      }
+    } catch (err) {
+      stop('Error: ' + (err && err.message ? err.message : String(err)));
+    }
+  }
+
+  // ---- wiring -------------------------------------------------------------
+  el.toggle.addEventListener('click', () => {
+    if (running) {
+      stop('Stopped by you.');
+    } else {
+      run();
+    }
+  });
+
+  document.documentElement.appendChild(host);
+  render();
+})();
